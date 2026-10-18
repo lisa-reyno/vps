@@ -6,51 +6,93 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # GitHub-hosted runners are hard-killed at 6 h (360 min). This is the maximum allowed.
     timeout-minutes: 360
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: 1. Enable Remote Desktop & Firewall (self-checked)
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+          # Self-check: make sure the RDP listener is really up (fail loudly instead of silently)
+          $up = $false
+          foreach ($i in 1..15) {
+            if (Get-NetTcpConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) { $up = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $up) {
+            Restart-Service TermService -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            $up = [bool](Get-NetTcpConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
+          }
+          if (-not $up) { throw 'RDP listener did not come up on port 3389' }
+          Write-Host 'RDP enabled - listener is up on port 3389.'
 
       - name: 2. Create Admin Account
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
+          # NOTE: the password MUST be quoted. An unquoted '#' starts a PowerShell
+          # comment, which silently truncated the original password!
+          $Password = 'P@ssw0rd1qazXSW@#'
+          $Secure   = ConvertTo-SecureString $Password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name 'NvDAdmin' -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name 'NvDAdmin' -Password $Secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group 'Administrators' -Member 'NvDAdmin' -ErrorAction SilentlyContinue
+          net user runneradmin "$Password" | Out-Null
+          Write-Host 'RDP logins ready: NvDAdmin or runneradmin (both Administrators, same password)'
 
-      - name: 3. Install & Connect Tailscale VPN
+      - name: 3. Install & Connect Tailscale (fails fast on bad key)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
 
-      - name: 4. Keep Server Alive (48 Hours)
-        run: |
-          for ($i = 1; $i -le 2880; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/2880] Server running..."
+          # GUARD: an empty/missing secret makes "tailscale up" print a browser-login
+          # URL and wait FOREVER in a headless runner. That was the original 30-min hang.
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw 'TAILSCALE_AUTHKEY is empty/missing. Add it in: Settings > Secrets and variables > Actions > New repository secret.'
           }
+
+          $msi = 'C:\tailscale.msi'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "Tailscale MSI install failed with exit code $($p.ExitCode)" }
+
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path $ts)) { throw 'tailscale.exe was not found after installation' }
+
+          & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname='github-rdp-server' --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed (exit code $LASTEXITCODE). The key must be a REUSABLE auth key that has not expired." }
+
+          # Wait until a tailnet IPv4 is actually assigned
+          $ts_ip = $null
+          foreach ($i in 1..30) {
+            $ts_ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($ts_ip) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ts_ip) { throw 'No Tailscale IP was assigned within 60 s - check the auth key' }
+
+          & $ts status
+
+          Write-Host ''
+          Write-Host '=================================================='
+          Write-Host '   >>> RDP SERVER IS READY! <<<'
+          Write-Host "   Tailscale IP : $ts_ip"
+          Write-Host '   Username     : NvDAdmin   (or runneradmin)'
+          Write-Host '   Password     : P@ssw0rd1qazXSW@#'
+          Write-Host '   Open mstsc.exe and connect to the Tailscale IP above'
+          Write-Host '=================================================='
+
+      - name: 4. Keep Server Alive (runs to the 6 h GitHub limit)
+        run: |
+          $deadline = (Get-Date).AddMinutes(350)
+          $i = 0
+          while ((Get-Date) -lt $deadline) {
+            $i++
+            Start-Sleep -Seconds 60
+            Write-Host ("[{0}] RDP server alive at {1} (GitHub kills the job at the 6 h mark)" -f $i, (Get-Date -Format 'HH:mm:ss'))
+          }س
