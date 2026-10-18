@@ -1,1 +1,95 @@
+name: Linux Cloud VPS (SSH)
 
+on:
+  workflow_dispatch:
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    # GitHub-hosted runners are hard-killed at 6 h (360 min). This is the maximum allowed.
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Set up SSH server & password login (self-checked)
+        run: |
+          set -e
+          sudo apt-get update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server >/dev/null
+
+          # Unlock password login for the "runner" account.
+          # The drop-in file MUST sort before cloud-init's 50-*.conf because in
+          # sshd_config the FIRST occurrence of an option wins.
+          echo 'runner:P@ssw0rd1qazXSW@#' | sudo chpasswd
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf 'PasswordAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/00-force-password.conf >/dev/null
+
+          sudo systemctl enable --now ssh >/dev/null 2>&1 || true
+          sudo systemctl restart ssh
+
+          # Self-check 1: config is valid and password auth is REALLY enabled
+          sudo sshd -t
+          EFFECTIVE="$(sudo sshd -T | awk '/^passwordauthentication/ {print $2}')"
+          if [ "$EFFECTIVE" != "yes" ]; then
+            echo "::error::PasswordAuthentication is '$EFFECTIVE', expected 'yes'"
+            exit 1
+          fi
+          # Self-check 2: sshd is really listening on port 22
+          if ! sudo ss -tln | grep -q ':22 '; then
+            echo "::error::sshd is not listening on port 22"
+            exit 1
+          fi
+          echo "SSH server ready - user 'runner', password auth verified (effective: $EFFECTIVE)"
+
+      - name: 2. Install & Connect Tailscale (fails fast on bad key)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+
+          # GUARD: an empty/missing secret makes "tailscale up" print a browser-login
+          # URL and wait FOREVER in a headless runner. Fail loudly instead.
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::TAILSCALE_AUTHKEY is empty/missing. Add it in: Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          if ! sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname='github-linux-vps' --accept-dns=false; then
+            echo "::error::tailscale up failed - the key must be a REUSABLE auth key that has not expired"
+            exit 1
+          fi
+
+          # Wait until a tailnet IPv4 is actually assigned
+          TS_IP=""
+          for _ in $(seq 1 30); do
+            TS_IP="$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)"
+            if [ -n "$TS_IP" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::No Tailscale IP was assigned within 60 s - check the auth key"
+            exit 1
+          fi
+
+          sudo tailscale status
+
+          {
+            echo '=================================================='
+            echo '   >>> LINUX SSH SERVER IS READY! <<<'
+            echo "   Tailscale IP : $TS_IP"
+            echo '   Username     : runner'
+            echo '   Password     : P@ssw0rd1qazXSW@#'
+            echo "   Connect      : ssh runner@$TS_IP"
+            echo '=================================================='
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 3. Keep Server Alive (runs to the 6 h GitHub limit)
+        run: |
+          end=$((SECONDS + 350 * 60))
+          n=0
+          while [ "$SECONDS" -lt "$end" ]; do
+            n=$((n + 1))
+            sleep 60
+            echo "[$n] SSH server alive at $(date -u '+%H:%M:%S UTC') (GitHub kills the job at the 6 h mark)"
+          done
